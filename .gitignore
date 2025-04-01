@@ -1,0 +1,8 @@
+# Node modules
+**/node_modules
+
+# Frontend environment variables
+frontend/.env
+
+# Backend environment variables
+backend/.env 
