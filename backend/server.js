@@ -8,8 +8,8 @@ const { MongoClient } = require('mongodb');
 const cors = require('cors');
 
 const app = express();
-app.use(cors({ // Enable CORS for all origins during development
-  origin: '*' // Be more specific in production!
+app.use(cors({ // Explicitly allow the frontend origin
+  origin: 'http://localhost:5173' // Frontend runs on port 5173
 }));
 app.use(express.json());
 app.get('/', (req, res) => {
@@ -85,10 +85,11 @@ app.get('/profile', (req, res) => {
   res.send('Profile: (placeholder)');
 });
 const server = http.createServer(app);
+const PORT = process.env.PORT || 3000; // Use port 3000
 const io = socketIo(server,
   { // Socket.IO CORS configuration
     cors: {
-      origin: "*", // Allow connections from any origin (adjust for production)
+      origin: "http://localhost:5173", // Explicitly allow the frontend origin
       methods: ["GET", "POST"]
     }
   }
@@ -109,11 +110,16 @@ const CANVAS_DOC_ID = 'mainCanvas';
 let db;
 let canvasCollection;
 
+// Cooldown configuration (e.g., 2 seconds)
+const PIXEL_PLACEMENT_COOLDOWN_MS = 2 * 1000; 
+// Map to store the timestamp of the last pixel placement for each user ID
+const userCooldowns = new Map(); 
+
 // In-memory rate limiting map
 const lastPixelTime = new Map();
 
 // Grid Constants
-const GRID_SIZE = 32;
+const GRID_SIZE = 64;
 const DEFAULT_COLOR = '#FFFFFF';
 
 // --- In-Memory Grid State ---
@@ -181,9 +187,9 @@ app.post('/verify-token', async (req, res) => {
 
 // Socket.IO connection handling
 io.on('connection', (socket) => {
-  console.log('New client connected');
+  console.log('New client connected:', socket.id);
   socket.isAuth = false; // Flag to track authentication status
-  socket.userId = null; // Store associated user ID
+  socket.userId = null; // Store associated user ID (e.g., Google sub)
 
   // Listen for socket authentication attempt
   socket.on('authenticateSocket', async (token) => {
@@ -217,62 +223,66 @@ io.on('connection', (socket) => {
     socket.emit('initialGrid', gridState);
   });
 
-  // Handle pixel placement events
-  socket.on('placePixel', (data) => {
-    console.log(`[${new Date().toISOString()}] Received placePixel:`, data);
-
-    // --- Authentication Check --- 
+  // Handle pixel placement requests
+  socket.on('placePixel', async (data) => {
     if (!socket.isAuth || !socket.userId) {
-      console.warn(`[${new Date().toISOString()}] Unauthorized placePixel attempt from socket ${socket.id}. Ignoring.`);
-      socket.emit('error', { message: 'Not authenticated. Please log in.' });
+      console.warn(`[${socket.id}] Denied placePixel: Socket not authenticated.`);
+      socket.emit('error', 'Authentication required to place pixels.');
       return;
     }
-    // --- End Authentication Check ---
 
-    // Use the authenticated userId from the socket, not the potentially spoofed one from data
-    const userId = socket.userId; 
     const { x, y, color } = data;
-
-    // --- Rate Limiting Check ---
-    const lastTime = lastPixelTime.get(userId) || 0;
+    const userId = socket.userId;
     const now = Date.now();
-    const cooldown = 100; // 100ms cooldown (allow faster updates)
-    if (now - lastTime < cooldown) {
-      console.log(`[${new Date().toISOString()}] Rate limit exceeded for user ${userId}. Ignoring.`);
-      socket.emit('error', { message: 'Rate limit exceeded. Please wait.' });
+
+    // --- Cooldown Check ---
+    const lastPlacementTime = userCooldowns.get(userId);
+    if (lastPlacementTime && (now - lastPlacementTime < PIXEL_PLACEMENT_COOLDOWN_MS)) {
+      const remainingTime = Math.ceil((PIXEL_PLACEMENT_COOLDOWN_MS - (now - lastPlacementTime)) / 1000);
+      console.log(`[${socket.id}] User ${userId} cooldown active. ${remainingTime}s remaining.`);
+      socket.emit('error', `Please wait ${remainingTime} seconds before placing another pixel.`);
       return;
     }
-    // Update last pixel time
-    lastPixelTime.set(userId, now);
+    // --- End Cooldown Check ---
 
-    // --- Update Grid State ---
-    if (y >= 0 && y < GRID_SIZE && x >= 0 && x < GRID_SIZE) {
-      gridState[y][x] = color;
-    } else {
-      console.warn(`Invalid coordinates received: (${x}, ${y})`);
-      // Optionally send an error back to the client
-      return; // Don't broadcast invalid updates
+    // Validate coordinates and color format (basic)
+    if (typeof x !== 'number' || typeof y !== 'number' || typeof color !== 'string' ||
+        x < 0 || x >= GRID_SIZE || y < 0 || y >= GRID_SIZE || !/^#[0-9A-F]{6}$/i.test(color))
+    { 
+      console.warn(`[${socket.id}] Invalid placePixel data:`, data);
+      socket.emit('error', 'Invalid pixel data or coordinates.');
+      return;
     }
-    // --- End Update Grid State ---
 
-    // --- Save Updated Grid State to DB ---
-    if (canvasCollection) {
-      canvasCollection.updateOne(
-        { _id: CANVAS_DOC_ID }, // Filter: find the specific canvas document
-        { $set: { grid: gridState } }, // Update: replace the grid field
-        { upsert: true } // Options: create if not found
-      ).catch(err => {
-          console.error('Error saving grid state to DB:', err);
-      });
-    } else {
-        console.warn('Cannot save grid state: DB collection not available.');
+    try {
+      // Update the specific pixel in the DB
+      const updateField = `grid.${y}.${x}`; // Path to the specific pixel in the nested array
+      const result = await canvasCollection.updateOne(
+        { _id: CANVAS_DOC_ID }, 
+        { $set: { [updateField]: color } },
+        { upsert: false } // Don't create if the document doesn't exist (it should)
+      );
+
+      if (result.modifiedCount > 0 || result.upsertedCount > 0) {
+        console.log(`[${socket.id}] User ${userId} placed pixel at (${x}, ${y}) with color ${color}`);
+        
+        // Update the user's last placement time *after* successful DB update
+        userCooldowns.set(userId, now);
+
+        // Broadcast the update to all connected clients (including sender for confirmation)
+        io.emit('pixelUpdate', { x, y, color });
+        // Optionally, send confirmation only to sender with cooldown info
+        socket.emit('pixelPlacedSuccessfully', { cooldownEnds: now + PIXEL_PLACEMENT_COOLDOWN_MS }); 
+      } else {
+        // This might happen if the CANVAS_DOC_ID doesn't exist, handle appropriately
+        console.warn(`[${socket.id}] Failed to update pixel in DB for (${x}, ${y}). Document might be missing or field path incorrect.`);
+        socket.emit('error', 'Failed to save pixel. Please try again.');
+      }
+
+    } catch (dbError) {
+      console.error(`[${socket.id}] Database error placing pixel for user ${userId} at (${x}, ${y}):`, dbError);
+      socket.emit('error', 'A database error occurred.');
     }
-    // --- End Save Updated Grid State ---
-
-    console.log(`[${new Date().toISOString()}] Broadcasting pixelUpdate:`, { x, y, color });
-    // Broadcast the pixel update to all connected clients
-    io.emit('pixelUpdate', { x, y, color });
-    console.log(`[${new Date().toISOString()}] Broadcast complete.`);
   });
 
   socket.on('disconnect', () => {
@@ -280,7 +290,6 @@ io.on('connection', (socket) => {
   });
 });
 
-const PORT = process.env.PORT || 3001; // Default to 3001 if not set in .env or environment
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
 }); 
